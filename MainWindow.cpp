@@ -3,16 +3,19 @@
 #include "ui_MainWindow.h"
 #include "DeckLinkCapture.h"
 #include "StatusLabel.h"
-#include "MotionJPEG.h"
 #include <QAudioOutput>
 #include <QBuffer>
 #include <QDebug>
 #include <QMessageBox>
 #include <functional>
+#ifdef USE_VIDEO_RECORDING
+#include "VideoEncoder.h"
+#endif
 
 enum {
 	DisplayModeRole = Qt::UserRole,
 	FieldDominanceRole,
+	FrameRateRole,
 };
 
 static inline void BlockSignals(QWidget *w, std::function<void ()> const &callback)
@@ -37,9 +40,12 @@ const QVector<QPair<DeinterlaceMode, QString>> deinterlace_mode_list = {
 	qMakePair(DeinterlaceMode::InterpolateEven,		QString("Interporate Even")),
 	qMakePair(DeinterlaceMode::InterpolateOdd,		QString("Interporate Odd")),
 	qMakePair(DeinterlaceMode::Merge,				QString("Merge")),
+	qMakePair(DeinterlaceMode::MergeX2,				QString("Merge x2 Frames")),
 };
 
 struct MainWindow::Private {
+	QAction *a_record = nullptr;
+
 	DeckLinkCapture video_capture;
 
 	DeckLinkInputDevice *selected_device = nullptr;
@@ -48,11 +54,14 @@ struct MainWindow::Private {
 	ProfileCallback *profile_callback = nullptr;
 	BMDDisplayMode display_mode = bmdModeHD1080i5994;
 	BMDFieldDominance field_dominance = bmdUnknownFieldDominance;
+	double fps = 0;
 
 	std::shared_ptr<QAudioOutput> audio_output;
 	QIODevice *audio_output_device = nullptr;
 
-	std::shared_ptr<MotionJPEG> mjpg;
+#ifdef USE_VIDEO_RECORDING
+	std::shared_ptr<VideoEncoder> video_encoder;
+#endif
 
 	StatusLabel *status_label = nullptr;
 
@@ -65,6 +74,17 @@ MainWindow::MainWindow(QWidget *parent)
 	, m(new Private)
 {
 	ui->setupUi(this);
+
+#ifdef USE_VIDEO_RECORDING
+	{
+		QMenu *menu = new QMenu(tr("Experimental"), this);
+		m->a_record = new QAction("Record", this);
+		m->a_record->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_R));
+		menu->addAction(m->a_record);
+		ui->menubar->addMenu(menu);
+		connect(m->a_record, SIGNAL(triggered(bool)), this, SLOT(on_action_record_triggered(bool)));
+	}
+#endif
 
 	m->status_label = new StatusLabel(this);
 	ui->statusbar->addWidget(m->status_label);
@@ -147,7 +167,7 @@ void MainWindow::customEvent(QEvent *event)
 		removeDevice(discoveryEvent->decklink());
 	} else if (event->type() == kVideoFormatChangedEvent) {
 		DeckLinkInputFormatChangedEvent* formatEvent = dynamic_cast<DeckLinkInputFormatChangedEvent*>(event);
-		changeDisplayMode(formatEvent->DisplayMode());
+		changeDisplayMode(formatEvent->DisplayMode(), formatEvent->fps());
 	} else if (event->type() == kVideoFrameArrivedEvent) {
 		DeckLinkInputFrameArrivedEvent* frameArrivedEvent = dynamic_cast<DeckLinkInputFrameArrivedEvent*>(event);
 		setStatusBarText(frameArrivedEvent->SignalValid() ? QString() : tr("No valid input signal"));
@@ -198,6 +218,7 @@ void MainWindow::updateUI()
 
 void MainWindow::internalStartCapture(bool start)
 {
+	stopRecord();
 	if (isCapturing()) {
 		// stop capture
 		m->selected_device->stopCapture();
@@ -210,6 +231,7 @@ void MainWindow::internalStartCapture(bool start)
 		if (item) {
 			m->display_mode = (BMDDisplayMode)item->data(DisplayModeRole).toInt();
 			m->field_dominance = (BMDFieldDominance)item->data(FieldDominanceRole).toUInt();
+			m->fps = item->data(FrameRateRole).toDouble();
 		}
 		bool auto_detect = isVideoFormatAutoDetectionEnabled();
 		m->video_capture.start(m->selected_device, m->display_mode, m->field_dominance, auto_detect, isAudioCaptureEnabled());
@@ -285,27 +307,22 @@ void MainWindow::refreshDisplayModeMenu(void)
 		BMDDisplayMode mode = displayMode->GetDisplayMode();
 		BMDFieldDominance fdom = displayMode->GetFieldDominance();
 
+		double fps = DeckLinkInputDevice::frameRate(displayMode);
+
 		if ((deckLinkInput->DoesSupportVideoMode(m->selected_input_connection, mode, bmdFormatUnspecified, bmdSupportedVideoModeDefault, &supported) == S_OK) && supported) {
 			QString name;
 			{
-				BSTR modeName = nullptr;
-#ifdef Q_OS_WIN
-				if (displayMode->GetName(&modeName) == S_OK && modeName) {
-					name = QString::fromUtf16((ushort const *)modeName);
-					SysFreeString(modeName);
+				DLString modeName;
+				if (displayMode->GetName(&modeName) == S_OK && !modeName.empty()) {
+					name = modeName;
 				}
-#else
-				if (displayMode->GetName(const_cast<const char **>(&modeName)) == S_OK && modeName) {
-					name = QString(modeName);
-					free(modeName);
-				}
-#endif
 			}
 			if (!name.isEmpty()) {
 				int row = ui->listWidget_display_mode->count();
 				auto *item = new QListWidgetItem(name);
 				item->setData(DisplayModeRole, QVariant::fromValue((uint64_t)mode));
 				item->setData(FieldDominanceRole, QVariant::fromValue((uint32_t)fdom));
+				item->setData(FrameRateRole, QVariant::fromValue(fps));
 				ui->listWidget_display_mode->addItem(item);
 				if (mode == m->display_mode) {
 					ui->listWidget_display_mode->setCurrentRow(row);
@@ -451,7 +468,7 @@ void MainWindow::changeInputDevice(int selectedDeviceIndex)
 	changeInputConnection(m->selected_input_connection, false);
 
 	if (capturing) {
-		changeDisplayMode(m->display_mode);
+		changeDisplayMode(m->display_mode, m->fps);
 		startCapture();
 	}
 }
@@ -482,7 +499,7 @@ void MainWindow::changeInputConnection(BMDVideoConnection conn, bool errorcheck)
 	refreshDisplayModeMenu();
 }
 
-void MainWindow::changeDisplayMode(BMDDisplayMode dispmode)
+void MainWindow::changeDisplayMode(BMDDisplayMode dispmode, double fps)
 {
 	for (int i = 0; i < ui->listWidget_display_mode->count(); i++) {
 		auto *item = ui->listWidget_display_mode->item(i);
@@ -492,6 +509,7 @@ void MainWindow::changeDisplayMode(BMDDisplayMode dispmode)
 					ui->listWidget_display_mode->setCurrentRow(i);
 				});
 				m->display_mode = dispmode;
+				m->fps = fps;
 				restartCapture();
 				return;
 			}
@@ -519,8 +537,9 @@ void MainWindow::on_listWidget_display_mode_currentRowChanged(int currentRow)
 	(void)currentRow;
 	QListWidgetItem *item = ui->listWidget_display_mode->currentItem();
 	if (!item) return;
-	auto v = item->data(Qt::UserRole).toUInt();
-	changeDisplayMode((BMDDisplayMode)v);
+	auto mode = item->data(DisplayModeRole).toUInt();
+	auto fps = item->data(FrameRateRole).toDouble();
+	changeDisplayMode((BMDDisplayMode)mode, fps);
 }
 
 void MainWindow::on_listWidget_display_mode_itemDoubleClicked(QListWidgetItem *item)
@@ -560,9 +579,11 @@ void MainWindow::onPlayAudio(const QByteArray &samples)
 	if (m->audio_output_device) {
 		m->audio_output_device->write(samples);
 	}
-	if (m->mjpg) {
-		m->mjpg->putAudioSamples(samples);
+#ifdef USE_VIDEO_RECORDING
+	if (m->video_encoder) {
+		m->video_encoder->putAudioFrame(samples);
 	}
+#endif
 }
 
 void MainWindow::on_comboBox_deinterlace_currentIndexChanged(int index)
@@ -581,33 +602,45 @@ void MainWindow::setImage(const QImage &image0, const QImage &image1)
 {
 	ui->widget_image->setImage(image0, image1);
 
-	if (m->mjpg) {
-		m->mjpg->putVideoFrame(image0);
+#ifdef USE_VIDEO_RECORDING
+	if (m->video_encoder) {
+		m->video_encoder->putVideoFrame(image0);
+		if (m->video_capture.deinterlaceMode() == DeinterlaceMode::MergeX2) {
+			m->video_encoder->putVideoFrame(image1);
+		}
 	}
+#endif
+}
+
+void MainWindow::stopRecord()
+{
+#ifdef USE_VIDEO_RECORDING
+	if (m->video_encoder) {
+		m->video_encoder->thread_stop();
+		m->video_encoder.reset();
+	}
+#endif
 }
 
 void MainWindow::toggleRecord()
 {
-	if (m->mjpg) {
-		m->mjpg->thread_stop();
-		m->mjpg.reset();
+#ifdef USE_VIDEO_RECORDING
+	if (m->video_encoder) {
+		stopRecord();
 	} else {
-		MotionJPEG::VideoOption vopt;
-		vopt.width = 960;
-		vopt.height = 540;
-		MotionJPEG::AudioOption aopt;
-		if (isAudioCaptureEnabled()) {
-			aopt.channels = 2;
-			aopt.frequency = 48000;
-		} else {
-			aopt.channels = 0;
+		VideoEncoder::VideoOption vopt;
+		vopt.fps = m->fps;
+		if (m->video_capture.deinterlaceMode() == DeinterlaceMode::MergeX2) {
+			vopt.fps *= 2;
 		}
-		m->mjpg = std::make_shared<MotionJPEG>();
-		m->mjpg->thread_start("/tmp/a.avi", vopt, aopt);
+		VideoEncoder::AudioOption aopt;
+		m->video_encoder = std::make_shared<VideoEncoder>();
+		m->video_encoder->thread_start("a.avi", vopt, aopt);
 	}
+#endif
 }
 
-void MainWindow::on_action_record_triggered()
+void MainWindow::on_action_record_triggered(bool)
 {
 	toggleRecord();
 }

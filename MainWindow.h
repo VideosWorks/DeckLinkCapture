@@ -56,9 +56,10 @@ public:
 
 	void changeInputDevice(int selectedDeviceIndex);
 	void changeInputConnection(BMDVideoConnection conn, bool errorcheck);
-	void changeDisplayMode(BMDDisplayMode dispmode);
+	void changeDisplayMode(BMDDisplayMode dispmode, double fps);
 	void setDeinterlaceMode(DeinterlaceMode mode);
 	bool isAudioCaptureEnabled() const;
+	void stopRecord();
 private slots:
 	void onPlayAudio(QByteArray const &samples);
 	void on_checkBox_display_mode_auto_detection_clicked(bool checked);
@@ -70,7 +71,7 @@ private slots:
 	void on_comboBox_deinterlace_currentIndexChanged(int index);
 	void on_checkBox_audio_stateChanged(int arg1);
 	void setImage(const QImage &image0, const QImage &image1);
-	void on_action_record_triggered();
+	void on_action_record_triggered(bool);
 };
 
 #endif // MAINWINDOW_H

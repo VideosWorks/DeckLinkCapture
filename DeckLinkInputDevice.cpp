@@ -36,7 +36,7 @@
 struct DeckLinkInputDevice::Private {
 	MainWindow *mainwindow = nullptr;
 	QAtomicInt refcount = 1;
-	//
+
 	QString device_name;
 	IDeckLink *decklink = nullptr;
 	IDeckLinkInput *decklink_input = nullptr;
@@ -48,7 +48,6 @@ struct DeckLinkInputDevice::Private {
 	bool currently_capturing = false;
 	bool apply_detected_input_mode = false;
 	int64_t supported_input_connections = 0;
-	//
 };
 
 DeckLinkInputDevice::DeckLinkInputDevice(MainWindow *mw, IDeckLink *device)
@@ -140,11 +139,7 @@ bool DeckLinkInputDevice::init()
 {
 	HRESULT result;
 	IDeckLinkProfileAttributes *deckLinkAttributes = nullptr;
-#ifdef Q_OS_WIN
-	BSTR deviceNameStr;
-#else
-	const char *deviceNameStr;
-#endif
+	DLString deviceNameStr;
 
 	// Get input interface
 	result = m->decklink->QueryInterface(IID_IDeckLinkInput, (void**)&m->decklink_input);
@@ -190,13 +185,7 @@ bool DeckLinkInputDevice::init()
 	// Get device name
 	result = m->decklink->GetDisplayName(&deviceNameStr);
 	if (result == S_OK) {
-#ifdef Q_OS_WIN
-		m->device_name = QString::fromUtf16((ushort const *)deviceNameStr);
-		SysFreeString(deviceNameStr);
-#else
 		m->device_name = deviceNameStr;
-		free((void*)deviceNameStr);
-#endif
 	} else {
 		m->device_name = "DeckLink";
 	}
@@ -309,6 +298,14 @@ IDeckLinkProfileManager *DeckLinkInputDevice::getProfileManager()
 	return m->decklink_profile_manager;
 }
 
+double DeckLinkInputDevice::frameRate(IDeckLinkDisplayMode *mode)
+{
+	BMDTimeValue duration = 0;
+	BMDTimeScale scale = 0;
+	mode->GetFrameRate(&duration, &scale);
+	return (double)scale / duration;
+}
+
 HRESULT DeckLinkInputDevice::VideoInputFormatChanged(BMDVideoInputFormatChangedEvents notificationEvents, IDeckLinkDisplayMode *newMode, BMDDetectedVideoInputFormatFlags detectedSignalFlags)
 {
 	HRESULT result;
@@ -335,6 +332,8 @@ HRESULT DeckLinkInputDevice::VideoInputFormatChanged(BMDVideoInputFormatChangedE
 		return result;
 	}
 
+	double fps = frameRate(newMode);
+
 	// Start the capture
 	result = m->decklink_input->StartStreams();
 	if (result != S_OK) {
@@ -344,7 +343,7 @@ HRESULT DeckLinkInputDevice::VideoInputFormatChanged(BMDVideoInputFormatChangedE
 
 	// Notify UI of new display mode
 	if ((m->mainwindow) && (notificationEvents & bmdVideoInputDisplayModeChanged)) {
-		QCoreApplication::postEvent(m->mainwindow, new DeckLinkInputFormatChangedEvent(newMode->GetDisplayMode()));
+		QCoreApplication::postEvent(m->mainwindow, new DeckLinkInputFormatChangedEvent(newMode->GetDisplayMode(), fps));
 	}
 
 	return S_OK;
@@ -398,21 +397,12 @@ HRESULT DeckLinkInputDevice::VideoInputFrameArrived(IDeckLinkVideoInputFrame *vi
 void DeckLinkInputDevice::getAncillaryDataFromFrame(IDeckLinkVideoInputFrame *videoFrame, BMDTimecodeFormat timecodeFormat, QString *timecodeString, QString *userBitsString)
 {
 	IDeckLinkTimecode *timecode	= nullptr;
-#ifdef Q_OS_WIN
-	BSTR timecodeStr = nullptr;
-#else
-	const char *timecodeStr	= nullptr;
-#endif
+	DLString timecodeStr;
 	BMDTimecodeUserBits userBits = 0;
 
 	if (videoFrame && timecodeString && userBitsString && videoFrame->GetTimecode(timecodeFormat, &timecode) == S_OK) {
 		if (timecode->GetString(&timecodeStr) == S_OK) {
-			*timecodeString = QString::fromUtf16((ushort const *)timecodeStr);
-#ifdef Q_OS_WIN
-			SysFreeString(timecodeStr);
-#else
-			free((void*)timecodeStr);
-#endif
+			*timecodeString = timecodeStr;
 		} else {
 			*timecodeString = "";
 		}
@@ -540,9 +530,10 @@ void DeckLinkInputDevice::getHDRMetadataFromFrame(IDeckLinkVideoInputFrame* vide
 	}
 }
 
-DeckLinkInputFormatChangedEvent::DeckLinkInputFormatChangedEvent(BMDDisplayMode displayMode)
+DeckLinkInputFormatChangedEvent::DeckLinkInputFormatChangedEvent(BMDDisplayMode displayMode, double fps)
 	: QEvent(kVideoFormatChangedEvent)
 	, display_mode_(displayMode)
+	, fps_(fps)
 {
 }
 
